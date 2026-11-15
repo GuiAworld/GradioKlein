@@ -1,0 +1,14 @@
+.python/
+.venv/
+.python_pkg.zip
+__pycache__/
+*.pyc
+*.pyo
+*.pt
+*.gguf
+*.safetensors
+models/
+LoRAs/
+sdcpp_bin/
+outputs/
+*.log
