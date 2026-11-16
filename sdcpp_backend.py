@@ -192,8 +192,21 @@ class SDCppBackend:
         env = os.environ.copy()
         if platform.system().lower() != "windows":
             extra_libs = [str(self.sdcpp_dir), "/usr/local/cuda/lib64", "/usr/local/nvidia/lib", "/usr/local/nvidia/lib64"]
+            try:
+                import site
+
+                for sp in site.getsitepackages() + [site.getusersitepackages()]:
+                    nv_root = Path(sp) / "nvidia"
+                    if nv_root.is_dir():
+                        for sub in nv_root.glob("*/lib"):
+                            if sub.is_dir():
+                                extra_libs.append(str(sub))
+            except Exception:
+                pass
             existing_ld = env.get("LD_LIBRARY_PATH", "")
-            env["LD_LIBRARY_PATH"] = ":".join([p for p in extra_libs if p] + ([existing_ld] if existing_ld else []))
+            if existing_ld:
+                extra_libs.append(existing_ld)
+            env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(p for p in extra_libs if p))
 
         print(f"[sd-server] Iniciando em {self.base_url} ...", flush=True)
         self._proc = subprocess.Popen(

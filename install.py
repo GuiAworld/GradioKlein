@@ -201,18 +201,63 @@ def _resolve_ghcr_cuda_layer() -> Tuple[str, str, Dict[str, str]]:
     return blob_url, selected_layer.get("mediaType", ""), {"Authorization": f"Bearer {token}"}
 
 
+def _build_linux_env(sdcpp_dir: Path) -> Dict[str, str]:
+    env = os.environ.copy()
+    lib_paths = [
+        str(sdcpp_dir),
+        "/usr/local/cuda/lib64",
+        "/usr/local/nvidia/lib",
+        "/usr/local/nvidia/lib64",
+    ]
+    # Inclui libs CUDA instaladas pelo pip do PyTorch (nvidia/*/lib), caso /usr/local/cuda difira
+    try:
+        import site
+
+        for sp in site.getsitepackages() + [site.getusersitepackages()]:
+            nv_root = Path(sp) / "nvidia"
+            if nv_root.is_dir():
+                for sub in nv_root.glob("*/lib"):
+                    if sub.is_dir():
+                        lib_paths.append(str(sub))
+    except Exception:
+        pass
+
+    existing = env.get("LD_LIBRARY_PATH", "")
+    if existing:
+        lib_paths.append(existing)
+    env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(p for p in lib_paths if p))
+    return env
+
+
+def _verify_sd_server_binary(sdcpp_dir: Path) -> None:
+    exe_name = "sd-server.exe" if platform.system().lower() == "windows" else "sd-server"
+    server_bin = sdcpp_dir / exe_name
+    if not server_bin.exists():
+        raise RuntimeError(f"Binário {exe_name} não encontrado em {sdcpp_dir}.")
+
+    env = _build_linux_env(sdcpp_dir) if platform.system().lower() != "windows" else os.environ.copy()
+    res = subprocess.run([str(server_bin), "--help"], env=env, capture_output=True, text=True, timeout=15)
+    if res.returncode != 0:
+        err_msg = (res.stderr or res.stdout or "").strip()
+        raise RuntimeError(f"{exe_name} --help retornou código {res.returncode}: {err_msg}")
+
+
 def _install_sdcpp_from_ghcr_cuda(sdcpp_dir: Path, dry_run: bool = False) -> bool:
     blob_url, media_type, headers = _resolve_ghcr_cuda_layer()
     log(f"  [GHCR] Layer CUDA resolvida: {blob_url} ({media_type})")
     if dry_run:
         return True
 
+    shutil.rmtree(sdcpp_dir, ignore_errors=True)
     sdcpp_dir.mkdir(parents=True, exist_ok=True)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         blob_path = Path(tmpdir) / "sdcpp_bin_layer.tar.gz"
         download_file(blob_url, blob_path, headers=headers, min_bytes=10 * 1024 * 1024)
 
         extracted_count = 0
+        pending_links: List[Tuple[Path, str]] = []
+
         with tarfile.open(blob_path, "r:*") as tf:
             for member in tf.getmembers():
                 clean_name = member.name.lstrip("./")
@@ -226,34 +271,35 @@ def _install_sdcpp_from_ghcr_cuda(sdcpp_dir: Path, dry_run: bool = False) -> boo
 
                 if member.issym() or member.islnk():
                     target_name = os.path.basename(member.linkname)
-                    if out_path.exists() or out_path.is_symlink():
-                        out_path.unlink()
-                    os.symlink(target_name, out_path)
-                    extracted_count += 1
+                    if target_name:
+                        pending_links.append((out_path, target_name))
                     continue
+
+                if out_path.exists() or out_path.is_symlink():
+                    out_path.unlink()
 
                 src_f = tf.extractfile(member)
                 if src_f is None:
                     continue
                 with src_f, open(out_path, "wb") as dst_f:
                     shutil.copyfileobj(src_f, dst_f)
-                if member.mode & 0o111 or out_path.name in ("sd-server", "sd-cli"):
+                if member.mode & 0o111 or out_path.name in ("sd-server", "sd-cli") or ".so" in out_path.name:
                     out_path.chmod(out_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
                 extracted_count += 1
 
-    server_bin = sdcpp_dir / "sd-server"
-    if extracted_count == 0 or not server_bin.exists():
-        raise RuntimeError("Não foi possível extrair sd-server da layer GHCR.")
+        for out_path, target_name in pending_links:
+            if out_path.exists() or out_path.is_symlink():
+                out_path.unlink()
+            os.symlink(target_name, out_path)
+            extracted_count += 1
 
-    # Validação de execução do binário pré-compilado (checa dependências dinâmicas no Linux)
-    env = os.environ.copy()
-    cuda_lib = "/usr/local/cuda/lib64"
-    env["LD_LIBRARY_PATH"] = f"{sdcpp_dir}:{cuda_lib}:{env.get('LD_LIBRARY_PATH', '')}".strip(":")
+    if extracted_count == 0:
+        raise RuntimeError("Não foi possível extrair arquivos da layer GHCR.")
+
     try:
-        res = subprocess.run([str(server_bin), "--help"], env=env, capture_output=True, text=True, timeout=15)
-        if res.returncode != 0:
-            raise RuntimeError(f"sd-server --help retornou código {res.returncode}: {res.stderr}")
+        _verify_sd_server_binary(sdcpp_dir)
     except Exception as exc:
+        shutil.rmtree(sdcpp_dir, ignore_errors=True)
         raise RuntimeError(f"Falha ao validar binário CUDA extraído: {exc}") from exc
 
     log(f"  [OK] Binários CUDA pré-compilados instalados em {sdcpp_dir} ({extracted_count} arquivos).")
@@ -282,10 +328,15 @@ def _pick_release_assets_for_platform() -> List[Dict[str, str]]:
     chosen: List[Dict[str, str]] = []
 
     if sys_name == "linux":
-        for pat in ("bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip", "bin-Linux-Ubuntu", "avx2.zip"):
-            for asset in assets:
-                name = asset.get("name", "")
-                if pat in name and name.endswith(".zip"):
+        linux_assets = [
+            a for a in assets
+            if "linux" in a.get("name", "").lower()
+            and a.get("name", "").endswith(".zip")
+            and "rocm" not in a.get("name", "").lower()
+        ]
+        for pat in ("vulkan.zip", "ubuntu-24.04-x86_64.zip", "ubuntu", "avx2.zip"):
+            for asset in linux_assets:
+                if pat in asset.get("name", "").lower():
                     chosen.append(asset)
                     return chosen
     elif sys_name == "windows":
@@ -310,7 +361,10 @@ def _install_sdcpp_from_github_release(sdcpp_dir: Path, dry_run: bool = False) -
     if dry_run:
         return
 
+    shutil.rmtree(sdcpp_dir, ignore_errors=True)
     sdcpp_dir.mkdir(parents=True, exist_ok=True)
+    pending_links: List[Tuple[Path, str]] = []
+
     with tempfile.TemporaryDirectory() as tmpdir:
         for asset in assets:
             zip_path = Path(tmpdir) / asset["name"]
@@ -323,20 +377,40 @@ def _install_sdcpp_from_github_release(sdcpp_dir: Path, dry_run: bool = False) -
                     if not base:
                         continue
                     out_file = sdcpp_dir / base
+                    unix_mode = info.external_attr >> 16
+                    if stat.S_ISLNK(unix_mode):
+                        target_name = os.path.basename(zf.read(info).decode("utf-8", errors="ignore").strip())
+                        if target_name:
+                            pending_links.append((out_file, target_name))
+                        continue
+
+                    if out_file.exists() or out_file.is_symlink():
+                        out_file.unlink()
                     with zf.open(info, "r") as src_f, open(out_file, "wb") as dst_f:
                         shutil.copyfileobj(src_f, dst_f)
-                    if platform.system().lower() == "linux" and base in ("sd-server", "sd-cli") or base.endswith(".so"):
+                    if platform.system().lower() == "linux" and (base in ("sd-server", "sd-cli") or ".so" in base):
                         out_file.chmod(out_file.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    log(f"  [OK] Binários pré-compilados extraídos em {sdcpp_dir}.")
+    for out_file, target_name in pending_links:
+        if out_file.exists() or out_file.is_symlink():
+            out_file.unlink()
+        os.symlink(target_name, out_file)
+
+    _verify_sd_server_binary(sdcpp_dir)
+    log(f"  [OK] Binários pré-compilados extraídos e validados em {sdcpp_dir}.")
 
 
 def install_sdcpp_binaries(sdcpp_dir: Path, dry_run: bool = False) -> None:
     log("[3/4] Instalando binários pré-compilados do stable-diffusion.cpp (sem compilação)...")
     server_exe = sdcpp_dir / ("sd-server.exe" if platform.system().lower() == "windows" else "sd-server")
     if server_exe.exists() and not dry_run:
-        log(f"  [OK] {server_exe.name} já presente em {sdcpp_dir}.")
-        return
+        try:
+            _verify_sd_server_binary(sdcpp_dir)
+            log(f"  [OK] {server_exe.name} já presente e válido em {sdcpp_dir}.")
+            return
+        except Exception as exc:
+            log(f"  [AVISO] Binário existente em {sdcpp_dir} inválido ({exc}); reinstalando...")
+            shutil.rmtree(sdcpp_dir, ignore_errors=True)
 
     sys_name = platform.system().lower()
     has_nvidia = shutil.which("nvidia-smi") is not None
