@@ -240,6 +240,7 @@ def _build_linux_env(sdcpp_dir: Path) -> Dict[str, str]:
     if existing:
         lib_paths.append(existing)
     env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(p for p in lib_paths if p))
+    env["GGML_BACKEND_DIR"] = str(sdcpp_dir)
     return env
 
 
@@ -262,7 +263,7 @@ def _build_sd_server_cmd(sdcpp_dir: Path, extra_args: List[str]) -> Tuple[List[s
 
 def _verify_sd_server_binary(sdcpp_dir: Path) -> None:
     cmd, env = _build_sd_server_cmd(sdcpp_dir, ["--help"])
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15)
+    res = subprocess.run(cmd, env=env, cwd=str(sdcpp_dir), capture_output=True, text=True, timeout=15)
     if res.returncode != 0:
         err_msg = (res.stderr or res.stdout or "").strip()
         raise RuntimeError(f"sd-server --help retornou código {res.returncode}: {err_msg}")

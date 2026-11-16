@@ -218,6 +218,7 @@ class SDCppBackend:
             if existing_ld:
                 dedup_libs.append(existing_ld)
             env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(dedup_libs))
+            env["GGML_BACKEND_DIR"] = str(self.sdcpp_dir)
 
         print(f"[sd-server] Iniciando em {self.base_url} ...", flush=True)
         self._proc = subprocess.Popen(
@@ -227,6 +228,7 @@ class SDCppBackend:
             text=True,
             bufsize=1,
             env=env,
+            cwd=str(self.sdcpp_dir),
         )
         self._log_thread = threading.Thread(target=self._pump_logs, args=(self._proc.stdout,), daemon=True)
         self._log_thread.start()
