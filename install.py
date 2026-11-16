@@ -141,9 +141,9 @@ def _http_get_json(url: str, headers: Optional[Dict[str, str]] = None) -> Dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _resolve_ghcr_cuda_layer() -> Tuple[str, str, Dict[str, str]]:
+def _resolve_ghcr_cuda_info() -> Tuple[List[Dict], List[Dict], Dict[str, str]]:
     """
-    Resolve a layer pré-compilada contendo /sd.cpp/bin da imagem oficial
+    Resolve o manifesto linux/amd64 e histórico de layers da imagem oficial
     ghcr.io/leejet/stable-diffusion.cpp:master-cuda sem usar Docker nem compilar.
     """
     token_data = _http_get_json(f"https://ghcr.io/token?scope=repository:{GHCR_REPO}:pull")
@@ -174,42 +174,50 @@ def _resolve_ghcr_cuda_layer() -> Tuple[str, str, Dict[str, str]]:
     if not layers:
         raise RuntimeError("Nenhuma layer encontrada no manifesto GHCR.")
 
+    non_empty_history: List[Dict] = []
     config_digest = manifest.get("config", {}).get("digest")
-    selected_layer = None
-
     if config_digest:
         cfg = _http_get_json(
             f"https://ghcr.io/v2/{GHCR_REPO}/blobs/{config_digest}",
             headers={"Authorization": f"Bearer {token}"},
         )
         non_empty_history = [h for h in cfg.get("history", []) if not h.get("empty_layer", False)]
-        if len(non_empty_history) == len(layers):
-            for hist_item, layer_item in zip(non_empty_history, layers):
-                created_by = hist_item.get("created_by", "")
-                if "/sd.cpp/build/bin" in created_by or "/sd.cpp/bin" in created_by:
-                    selected_layer = layer_item
-                    break
+
+    return layers, non_empty_history, {"Authorization": f"Bearer {token}"}
+
+
+def _resolve_ghcr_cuda_layer() -> Tuple[str, str, Dict[str, str]]:
+    layers, non_empty_history, blob_headers = _resolve_ghcr_cuda_info()
+    selected_layer = None
+
+    if len(non_empty_history) == len(layers):
+        for hist_item, layer_item in zip(non_empty_history, layers):
+            created_by = hist_item.get("created_by", "")
+            if "/sd.cpp/build/bin" in created_by or "/sd.cpp/bin" in created_by:
+                selected_layer = layer_item
+                break
 
     if selected_layer is None:
-        # Fallback heurístico: a layer de binários compilados costuma ficar entre 50MB e 1.5GB
-        # e não é a base CUDA gigante nem o pequeno script entrypoint do final.
         candidates = [l for l in layers if 30 * 1024 * 1024 <= int(l.get("size", 0)) <= 1500 * 1024 * 1024]
         selected_layer = candidates[-1] if candidates else layers[-1]
 
     blob_digest = selected_layer["digest"]
     blob_url = f"https://ghcr.io/v2/{GHCR_REPO}/blobs/{blob_digest}"
-    return blob_url, selected_layer.get("mediaType", ""), {"Authorization": f"Bearer {token}"}
+    return blob_url, selected_layer.get("mediaType", ""), blob_headers
 
 
-def _build_linux_env(sdcpp_dir: Path) -> Dict[str, str]:
-    env = os.environ.copy()
-    lib_paths = [
-        str(sdcpp_dir),
-        "/usr/local/cuda/lib64",
-        "/usr/local/nvidia/lib",
-        "/usr/local/nvidia/lib64",
-    ]
-    # Inclui libs CUDA instaladas pelo pip do PyTorch (nvidia/*/lib), caso /usr/local/cuda difira
+def _build_linux_lib_paths(sdcpp_dir: Path) -> List[str]:
+    runtime_dir = sdcpp_dir / "runtime_libs"
+    lib_paths: List[str] = [str(sdcpp_dir)]
+    if runtime_dir.is_dir():
+        lib_paths.append(str(runtime_dir))
+    lib_paths.extend(
+        [
+            "/usr/local/cuda/lib64",
+            "/usr/local/nvidia/lib",
+            "/usr/local/nvidia/lib64",
+        ]
+    )
     try:
         import site
 
@@ -221,7 +229,13 @@ def _build_linux_env(sdcpp_dir: Path) -> Dict[str, str]:
                         lib_paths.append(str(sub))
     except Exception:
         pass
+    lib_paths.extend(["/usr/lib64-nvidia", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"])
+    return list(dict.fromkeys(p for p in lib_paths if p))
 
+
+def _build_linux_env(sdcpp_dir: Path) -> Dict[str, str]:
+    env = os.environ.copy()
+    lib_paths = _build_linux_lib_paths(sdcpp_dir)
     existing = env.get("LD_LIBRARY_PATH", "")
     if existing:
         lib_paths.append(existing)
@@ -229,21 +243,99 @@ def _build_linux_env(sdcpp_dir: Path) -> Dict[str, str]:
     return env
 
 
-def _verify_sd_server_binary(sdcpp_dir: Path) -> None:
+def _build_sd_server_cmd(sdcpp_dir: Path, extra_args: List[str]) -> Tuple[List[str], Dict[str, str]]:
     exe_name = "sd-server.exe" if platform.system().lower() == "windows" else "sd-server"
     server_bin = sdcpp_dir / exe_name
     if not server_bin.exists():
         raise RuntimeError(f"Binário {exe_name} não encontrado em {sdcpp_dir}.")
 
-    env = _build_linux_env(sdcpp_dir) if platform.system().lower() != "windows" else os.environ.copy()
-    res = subprocess.run([str(server_bin), "--help"], env=env, capture_output=True, text=True, timeout=15)
+    if platform.system().lower() == "windows":
+        return [str(server_bin), *extra_args], os.environ.copy()
+
+    env = _build_linux_env(sdcpp_dir)
+    ld_linux = sdcpp_dir / "runtime_libs" / "ld-linux-x86-64.so.2"
+    if ld_linux.exists():
+        lib_path_str = ":".join(_build_linux_lib_paths(sdcpp_dir))
+        return [str(ld_linux), "--library-path", lib_path_str, str(server_bin), *extra_args], env
+    return [str(server_bin), *extra_args], env
+
+
+def _verify_sd_server_binary(sdcpp_dir: Path) -> None:
+    cmd, env = _build_sd_server_cmd(sdcpp_dir, ["--help"])
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=15)
     if res.returncode != 0:
         err_msg = (res.stderr or res.stdout or "").strip()
-        raise RuntimeError(f"{exe_name} --help retornou código {res.returncode}: {err_msg}")
+        raise RuntimeError(f"sd-server --help retornou código {res.returncode}: {err_msg}")
+
+
+def _extract_ubuntu24_runtime_libs(sdcpp_dir: Path, layers: List[Dict], non_empty_history: List[Dict], headers: Dict[str, str]) -> None:
+    """
+    Extrai ld-linux-x86-64.so.2, glibc (2.39), libstdc++ e libgomp da imagem Ubuntu 24.04
+    para que o binário pré-compilado rode no Ubuntu 22.04 do Google Colab sem compilar nada.
+    """
+    runtime_dir = sdcpp_dir / "runtime_libs"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    target_layers: List[Dict] = [layers[0]]
+    if len(non_empty_history) == len(layers):
+        for hist_item, layer_item in zip(non_empty_history, layers):
+            if "libgomp1" in hist_item.get("created_by", ""):
+                target_layers.append(layer_item)
+                break
+
+    wanted_prefixes = (
+        "ld-linux-x86-64.so",
+        "libc.so",
+        "libm.so",
+        "libpthread.so",
+        "libdl.so",
+        "librt.so",
+        "libresolv.so",
+        "libgcc_s.so",
+        "libstdc++.so",
+        "libgomp.so",
+    )
+
+    pending_links: List[Tuple[Path, str]] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for idx, layer in enumerate(target_layers):
+            blob_url = f"https://ghcr.io/v2/{GHCR_REPO}/blobs/{layer['digest']}"
+            blob_path = Path(tmpdir) / f"runtime_layer_{idx}.tar.gz"
+            download_file(blob_url, blob_path, headers=headers, min_bytes=1_000_000)
+
+            with tarfile.open(blob_path, "r:*") as tf:
+                for member in tf.getmembers():
+                    clean_name = member.name.lstrip("./")
+                    if not (clean_name.startswith("usr/lib/x86_64-linux-gnu/") or clean_name.startswith("lib/x86_64-linux-gnu/")):
+                        continue
+                    base = os.path.basename(clean_name)
+                    if not base or not base.startswith(wanted_prefixes) or member.isdir():
+                        continue
+                    out_path = runtime_dir / base
+                    if member.issym() or member.islnk():
+                        target_name = os.path.basename(member.linkname)
+                        if target_name:
+                            pending_links.append((out_path, target_name))
+                        continue
+                    if out_path.exists() or out_path.is_symlink():
+                        out_path.unlink()
+                    src_f = tf.extractfile(member)
+                    if src_f is None:
+                        continue
+                    with src_f, open(out_path, "wb") as dst_f:
+                        shutil.copyfileobj(src_f, dst_f)
+                    if "ld-linux" in base or ".so" in base:
+                        out_path.chmod(out_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    for out_path, target_name in pending_links:
+        if out_path.exists() or out_path.is_symlink():
+            out_path.unlink()
+        os.symlink(target_name, out_path)
 
 
 def _install_sdcpp_from_ghcr_cuda(sdcpp_dir: Path, dry_run: bool = False) -> bool:
-    blob_url, media_type, headers = _resolve_ghcr_cuda_layer()
+    layers, non_empty_history, headers = _resolve_ghcr_cuda_info()
+    blob_url, media_type, _ = _resolve_ghcr_cuda_layer()
     log(f"  [GHCR] Layer CUDA resolvida: {blob_url} ({media_type})")
     if dry_run:
         return True
@@ -298,9 +390,19 @@ def _install_sdcpp_from_ghcr_cuda(sdcpp_dir: Path, dry_run: bool = False) -> boo
 
     try:
         _verify_sd_server_binary(sdcpp_dir)
-    except Exception as exc:
-        shutil.rmtree(sdcpp_dir, ignore_errors=True)
-        raise RuntimeError(f"Falha ao validar binário CUDA extraído: {exc}") from exc
+    except Exception as first_exc:
+        err_str = str(first_exc)
+        if any(tok in err_str for tok in ("GLIBC_", "GLIBCXX_", "CXXABI_", "libgomp")):
+            log("  [GHCR] Host com glibc mais antiga (ex.: Colab Ubuntu 22.04); baixando runtime_libs Ubuntu 24.04...")
+            try:
+                _extract_ubuntu24_runtime_libs(sdcpp_dir, layers, non_empty_history, headers)
+                _verify_sd_server_binary(sdcpp_dir)
+            except Exception as second_exc:
+                shutil.rmtree(sdcpp_dir, ignore_errors=True)
+                raise RuntimeError(f"Falha ao validar binário CUDA com runtime_libs: {second_exc}") from second_exc
+        else:
+            shutil.rmtree(sdcpp_dir, ignore_errors=True)
+            raise RuntimeError(f"Falha ao validar binário CUDA extraído: {first_exc}") from first_exc
 
     log(f"  [OK] Binários CUDA pré-compilados instalados em {sdcpp_dir} ({extracted_count} arquivos).")
     return True

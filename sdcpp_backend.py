@@ -191,7 +191,11 @@ class SDCppBackend:
 
         env = os.environ.copy()
         if platform.system().lower() != "windows":
-            extra_libs = [str(self.sdcpp_dir), "/usr/local/cuda/lib64", "/usr/local/nvidia/lib", "/usr/local/nvidia/lib64"]
+            extra_libs = [str(self.sdcpp_dir)]
+            runtime_dir = self.sdcpp_dir / "runtime_libs"
+            if runtime_dir.is_dir():
+                extra_libs.append(str(runtime_dir))
+            extra_libs.extend(["/usr/local/cuda/lib64", "/usr/local/nvidia/lib", "/usr/local/nvidia/lib64"])
             try:
                 import site
 
@@ -203,10 +207,17 @@ class SDCppBackend:
                                 extra_libs.append(str(sub))
             except Exception:
                 pass
+            extra_libs.extend(["/usr/lib64-nvidia", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"])
+            dedup_libs = list(dict.fromkeys(p for p in extra_libs if p))
+
+            ld_linux = runtime_dir / "ld-linux-x86-64.so.2"
+            if ld_linux.exists():
+                cmd = [str(ld_linux), "--library-path", ":".join(dedup_libs), *cmd]
+
             existing_ld = env.get("LD_LIBRARY_PATH", "")
             if existing_ld:
-                extra_libs.append(existing_ld)
-            env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(p for p in extra_libs if p))
+                dedup_libs.append(existing_ld)
+            env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(dedup_libs))
 
         print(f"[sd-server] Iniciando em {self.base_url} ...", flush=True)
         self._proc = subprocess.Popen(
